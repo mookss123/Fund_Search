@@ -410,10 +410,10 @@ with tab1:
 import time as _time
 import numpy as _np
 
-CNYES_BASE    = "https://fund.api.cnyes.com"
-CNYES_SEARCH  = f"{CNYES_BASE}/fund/api/v2/search/fund"
-CNYES_NAV_URL = f"{CNYES_BASE}/fund/api/v1/funds/{{cid}}/nav"
-CNYES_DIV_URL = f"{CNYES_BASE}/fund/api/v1/funds/{{cid}}/dividend"
+CNYES_BASE     = "https://fund.api.cnyes.com"
+CNYES_SEARCH   = f"{CNYES_BASE}/fund/api/v2/search/fund"
+CNYES_PERF_URL = f"{CNYES_BASE}/fund/api/v1/funds/{{cid}}/history/performance"
+CNYES_DIV_URL  = f"{CNYES_BASE}/fund/api/v1/funds/{{cid}}/dividend"
 
 CNYES_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -428,7 +428,6 @@ CNYES_FIELDS = (
     "displayNameLocal,forSale,investmentArea,nav,priceDate,"
     "return1Month,return3Month,return6Month,return1Year,saleStatus"
 )
-
 CNYES_FUND_GROUP = {
     "全部":"","股票型":"G1","債券型":"G2","平衡型":"G3",
     "保本型":"G4","貨幣型":"G5","其他":"G6",
@@ -450,9 +449,7 @@ CNYES_BRAND = {
     "野村":"I80","瀚亞":"I81","國泰":"I82",
 }
 
-
-# ── 工具函式 ─────────────────────────────────────────────────────────────────
-
+# ── 工具 ─────────────────────────────────────────────────────────────────────
 def _ts(unix):
     try:
         return datetime.datetime.utcfromtimestamp(int(unix)).strftime("%Y-%m-%d")
@@ -464,14 +461,12 @@ def _fmt_pct(v):
         return "—"
     return f"{v:+.2f}%"
 
-def _fmt_pct_plain(v):
+def _fmt_plain(v):
     if v is None or (isinstance(v, float) and _np.isnan(v)):
         return "—"
     return f"{v:.2f}%"
 
-
-# ── API 函式 ─────────────────────────────────────────────────────────────────
-
+# ── API ───────────────────────────────────────────────────────────────────────
 def cnyes_search(page, fund_group, area, currency, brand, for_sale_only):
     params = {
         "order":"priceDate","sort":"desc","page":page,
@@ -487,114 +482,63 @@ def cnyes_search(page, fund_group, area, currency, brand, for_sale_only):
         r = requests.get(CNYES_SEARCH, params=params, headers=CNYES_HEADERS, timeout=12)
         r.raise_for_status()
         raw = r.json().get("items", {})
-        return {
-            "items": raw.get("data", []),
-            "meta": {
-                "last_page": raw.get("last_page", 1),
-                "total":     raw.get("total", 0),
-                "next_page_url": raw.get("next_page_url"),
-            }
-        }
+        return {"items": raw.get("data", []),
+                "meta": {"last_page": raw.get("last_page",1), "total": raw.get("total",0)}}
     except Exception as e:
-        st.error(f"鉅亨搜尋 API 錯誤：{e}")
+        st.error(f"鉅亨搜尋錯誤：{e}")
         return None
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
-def cnyes_get_nav(cnyes_id: str) -> pd.DataFrame:
-    """抓取歷史淨值（最多 5 頁 = ~500 筆），回傳 DataFrame"""
-    all_data = []
-    cid_enc = cnyes_id.replace(",", "%2C")
-    for pg in range(1, 6):
-        try:
-            url = CNYES_NAV_URL.format(cid=cid_enc)
-            r = requests.get(url, params={"format":"table","page":pg},
-                             headers=CNYES_HEADERS, timeout=10)
-            r.raise_for_status()
-            data = r.json().get("items", {}).get("data", [])
-            if not data:
-                break
-            all_data.extend(data)
-            if len(data) < 100:
-                break
-        except Exception:
-            break
-    if not all_data:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_data)
-    df["date"] = pd.to_datetime(df["tradeDate"], unit="s")
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
-
+def cnyes_get_perf(cnyes_id: str) -> dict:
+    """history/performance → 週報酬序列 → 波動率 + 近3年報酬"""
+    cid_enc  = cnyes_id.replace(",", "%2C")
+    start_3y = int(_time.time()) - 3 * 366 * 24 * 3600
+    try:
+        url = CNYES_PERF_URL.format(cid=cid_enc)
+        r   = requests.get(url, params={"by":"w","startAt":start_3y},
+                           headers=CNYES_HEADERS, timeout=12)
+        r.raise_for_status()
+        perf = r.json().get("items", {}).get("performance", [])
+        if len(perf) < 5:
+            return {}
+        weekly_ret = [(1+perf[i]/100)/(1+perf[i-1]/100)-1 for i in range(1, len(perf))]
+        ann_std    = _np.std(weekly_ret) * (52**0.5) * 100
+        return {"ann_std": ann_std, "ret_3y": perf[-1], "n_weeks": len(perf)}
+    except Exception:
+        return {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cnyes_get_div(cnyes_id: str) -> pd.DataFrame:
-    """抓取配息紀錄"""
     cid_enc = cnyes_id.replace(",", "%2C")
     try:
         url = CNYES_DIV_URL.format(cid=cid_enc)
-        r = requests.get(url, params={"page":1}, headers=CNYES_HEADERS, timeout=10)
+        r   = requests.get(url, params={"page":1}, headers=CNYES_HEADERS, timeout=10)
         r.raise_for_status()
         data = r.json().get("items", {}).get("data", [])
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
         df["除息日"] = pd.to_datetime(df["excludingDate"], unit="s")
-        df = df.sort_values("除息日", ascending=False).reset_index(drop=True)
-        return df
+        return df.sort_values("除息日", ascending=False).reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
-
-def calc_fund_stats(nav_df: pd.DataFrame):
-    """從歷史淨值計算各期報酬與波動率"""
-    if nav_df.empty or len(nav_df) < 5:
-        return {}
-    closes = nav_df.set_index("date")["nav"]
-    latest = closes.iloc[-1]
-
-    def ret(months):
-        target = closes.index[-1] - pd.DateOffset(months=months)
-        past = closes[(closes.index >= target - pd.DateOffset(days=15)) &
-                      (closes.index <= target + pd.DateOffset(days=15))]
-        if past.empty:
-            return None
-        idx = abs(past.index - target).argmin()
-        return (latest / past.iloc[idx] - 1) * 100
-
-    ann_std = None
-    if len(closes) > 20:
-        recent = closes.tail(min(750, len(closes)))
-        ann_std = recent.pct_change().dropna().std() * (252 ** 0.5) * 100
-
-    return {
-        "ret_3m":  ret(3),
-        "ret_6m":  ret(6),
-        "ret_1y":  ret(12),
-        "ret_3y":  ret(36),
-        "ann_std": ann_std,
-    }
-
-
-def calc_div_stats(div_df: pd.DataFrame, latest_nav: float):
-    """從配息紀錄計算年化配息率"""
-    if div_df.empty or latest_nav == 0:
-        return {"ann_yield": None, "freq": 0, "latest_div": None}
+def calc_div_stats(div_df: pd.DataFrame, latest_nav: float) -> dict:
+    if div_df.empty or not latest_nav:
+        return {"ann_yield": None, "freq": 0}
     recent = div_df[div_df["除息日"] >= pd.Timestamp.now() - pd.DateOffset(years=3)]
     if recent.empty:
-        return {"ann_yield": None, "freq": 0, "latest_div": None}
+        return {"ann_yield": None, "freq": 0}
     total_days = (recent["除息日"].max() - recent["除息日"].min()).days
-    freq = round(len(recent) / (total_days / 365.25)) if total_days > 180 else len(recent)
-    freq = max(freq, 1)
+    freq = round(len(recent)/(total_days/365.25)) if total_days > 180 else len(recent)
+    freq = min(max(freq, 1), 12)
     latest_div = float(recent.iloc[0]["totalDistribution"])
     ann_yield  = (latest_div / latest_nav) * freq * 100
-    return {"ann_yield": ann_yield, "freq": freq, "latest_div": latest_div}
+    return {"ann_yield": ann_yield, "freq": freq}
 
-
-def make_tags(stats: dict, div_stats: dict, div_df: pd.DataFrame) -> str:
+def make_tags(perf: dict, div_stats: dict, div_df: pd.DataFrame) -> str:
     tags = []
-    # 波動率
-    std = stats.get("ann_std")
+    std = perf.get("ann_std")
     if std is not None:
         if std < 3:    tags.append("🧊超低波動")
         elif std < 12: tags.append("🟢低波動")
@@ -602,22 +546,22 @@ def make_tags(stats: dict, div_stats: dict, div_df: pd.DataFrame) -> str:
         else:          tags.append("🔴高波動")
     else:
         tags.append("⚪波動未知")
-    # 成長
-    r3y = stats.get("ret_3y")
+
+    r3y = perf.get("ret_3y")
     if r3y is not None:
         cagr = (1 + r3y/100) ** (1/3) - 1
-        if cagr > 0.12:   tags.append("🚀高成長")
+        if cagr > 0.12:    tags.append("🚀高成長")
         elif cagr >= 0.05: tags.append("📈大盤成長")
         elif cagr > 0:     tags.append("🐢緩步成長")
         else:              tags.append("📉衰退")
     else:
         tags.append("⚪成長未知")
-    # 配息
+
     if not div_df.empty and len(div_df) >= 3:
-        yields = div_df["distributionYield"].values[::-1][::-1]
+        yields = div_df["distributionYield"].values
         mean_y = yields.mean()
         if mean_y > 0:
-            cv = yields.std() / mean_y
+            cv    = yields.std() / mean_y
             trend = pd.Series(yields).corr(pd.Series(range(len(yields))))
             if cv < 0.15:                          tags.append("🛡️高穩定配息")
             elif pd.notna(trend) and trend > 0.6:  tags.append("🔥配息增長中")
@@ -631,16 +575,13 @@ def make_tags(stats: dict, div_stats: dict, div_df: pd.DataFrame) -> str:
         tags.append("⚪配息次數偏少")
     return " | ".join(tags)
 
-
-# ── Tab 2 UI ─────────────────────────────────────────────────────────────────
-
+# ── Tab 2 UI ──────────────────────────────────────────────────────────────────
 if "cnyes_cart" not in st.session_state:
     st.session_state.cnyes_cart = pd.DataFrame()
 
 with tab2:
     st.subheader("🔍 台灣可申購境外基金搜尋 (鉅亨網)")
 
-    # 篩選列
     ck1, ck2, ck3, ck4, ck5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
     with ck1:
         brand_lbl = st.selectbox("品牌", list(CNYES_BRAND.keys()), key="cnyes_brand")
@@ -663,17 +604,16 @@ with tab2:
         av = CNYES_AREA[area_lbl]
         cv = CNYES_CURRENCY[curr_lbl]
 
-        with st.spinner("連線鉅亨網中..."):
+        with st.spinner("搜尋基金清單..."):
             data = cnyes_search(1, fv, av, cv, bv, for_sale)
 
         if data:
-            meta      = data["meta"]
             items     = data["items"]
-            total     = meta["total"]
-            last_page = meta["last_page"]
+            total     = data["meta"]["total"]
+            last_page = data["meta"]["last_page"]
 
             if last_page > 1:
-                bar = st.progress(1/min(last_page, MAX_PAGES), text="抓取更多結果...")
+                bar = st.progress(1/min(last_page, MAX_PAGES), text="抓取更多頁面...")
                 for pg in range(2, min(last_page, MAX_PAGES)+1):
                     more = cnyes_search(pg, fv, av, cv, bv, for_sale)
                     if more:
@@ -682,45 +622,68 @@ with tab2:
                     _time.sleep(0.12)
                 bar.empty()
 
+            # ── 批次抓配息（和 ETF 頁一樣，搜尋時就算好）──
+            bar2    = st.progress(0, text="計算配息率...")
+            div_map = {}
+            for i, it in enumerate(items):
+                cid = it.get("cnyesId","")
+                if cid:
+                    div_df_i       = cnyes_get_div(cid)
+                    div_map[cid]   = calc_div_stats(div_df_i, it.get("nav") or 0)
+                bar2.progress((i+1)/len(items))
+            bar2.empty()
+
             rows = []
             for it in items:
+                cid       = it.get("cnyesId","")
+                ds        = div_map.get(cid, {})
+                ann_yield = ds.get("ann_yield")
+                freq      = ds.get("freq", 0)
+                if ann_yield is not None:
+                    freq_label = {1:"年配",2:"半年配",4:"季配",12:"月配"}.get(freq, f"{freq}次/年")
+                    yield_str  = f"{ann_yield:.2f}% ({freq_label})"
+                else:
+                    yield_str = "無配息"
+
                 rows.append({
                     "加入購物車": False,
-                    "鉅亨ID":      it.get("cnyesId",""),
-                    "基金名稱":    it.get("displayNameLocal",""),
-                    "計價幣別":    it.get("classCurrencyLocal",""),
-                    "投資地區":    it.get("investmentArea",""),
-                    "基金組別":    it.get("categoryAbbr",""),
-                    "淨值":        it.get("nav"),
-                    "今日漲跌%":   _fmt_pct(it.get("changePercent")),
-                    "近1月%":      _fmt_pct(it.get("return1Month")),
-                    "近3月%":      _fmt_pct(it.get("return3Month")),
-                    "近6月%":      _fmt_pct(it.get("return6Month")),
-                    "近1年%":      _fmt_pct(it.get("return1Year")),
-                    "淨值日期":    _ts(it.get("priceDate")),
-                    "可申購":      "✓" if it.get("forSale")==1 else "✗",
+                    "鉅亨ID":     cid,
+                    "基金名稱":   it.get("displayNameLocal",""),
+                    "計價幣別":   it.get("classCurrencyLocal",""),
+                    "投資地區":   it.get("investmentArea",""),
+                    "基金組別":   it.get("categoryAbbr",""),
+                    "淨值":       it.get("nav"),
+                    "今日漲跌%":  _fmt_pct(it.get("changePercent")),
+                    "近1月%":     _fmt_pct(it.get("return1Month")),
+                    "近3月%":     _fmt_pct(it.get("return3Month")),
+                    "近6月%":     _fmt_pct(it.get("return6Month")),
+                    "近1年%":     _fmt_pct(it.get("return1Year")),
+                    "年化配息率": yield_str,
+                    "淨值日期":   _ts(it.get("priceDate")),
+                    "可申購":     "✓" if it.get("forSale")==1 else "✗",
                 })
 
             df_cnyes = pd.DataFrame(rows)
-            st.session_state["cnyes_results"] = df_cnyes
-            st.session_state["cnyes_total"]   = total
-            st.session_state["cnyes_last_pg"] = last_page
-            st.session_state["cnyes_items"]   = {it["cnyesId"]: it for it in items}
+            st.session_state["cnyes_results"]  = df_cnyes
+            st.session_state["cnyes_total"]    = total
+            st.session_state["cnyes_last_pg"]  = last_page
+            st.session_state["cnyes_items"]    = {it["cnyesId"]: it for it in items}
+            st.session_state["cnyes_div_map"]  = div_map
         else:
             st.warning("查無結果，請調整篩選條件。")
             st.session_state.pop("cnyes_results", None)
 
-    # ── 顯示結果 ─────────────────────────────────────────────────────────────
+    # ── 顯示結果 ──────────────────────────────────────────────────────────────
     if "cnyes_results" in st.session_state:
         df_cnyes  = st.session_state["cnyes_results"]
         total     = st.session_state.get("cnyes_total", len(df_cnyes))
         last_page = st.session_state.get("cnyes_last_pg", 1)
         showing   = len(df_cnyes)
 
+        cap = f"共找到 **{total:,}** 檔"
         if last_page > MAX_PAGES:
-            st.success(f"共 **{total:,}** 檔，顯示前 **{showing}** 筆")
-        else:
-            st.success(f"共找到 **{total:,}** 檔")
+            cap += f"，顯示前 **{showing}** 筆"
+        st.success(cap)
 
         st.markdown("### 📊 搜尋結果（可勾選加入購物車）")
         edited_df = st.data_editor(
@@ -732,7 +695,7 @@ with tab2:
                 "基金名稱":   st.column_config.TextColumn("基金名稱", width="large"),
                 "淨值":       st.column_config.NumberColumn("淨值", format="%.4f"),
             },
-            height=400,
+            height=420,
         )
 
         if st.button("🛒 將勾選項目加入購物車", key="cnyes_add_cart"):
@@ -750,82 +713,72 @@ with tab2:
 
         st.divider()
 
-        # ── 個別詳細資訊 ─────────────────────────────────────────────────────
+        # ── 個別詳細資訊 ──────────────────────────────────────────────────────
         st.markdown("### 🔍 個別詳細資訊（點擊展開）")
         items_map = st.session_state.get("cnyes_items", {})
+        div_map   = st.session_state.get("cnyes_div_map", {})
 
         for _, row in df_cnyes.iterrows():
-            cid  = row["鉅亨ID"]
-            name = row["基金名稱"]
+            cid     = row["鉅亨ID"]
+            name    = row["基金名稱"]
+            nav_val = row["淨值"] or 0
+
             with st.expander(f"**{name}**　{row['計價幣別']}　{row['投資地區']}"):
-                with st.spinner(f"載入 {name} 詳細資料..."):
-                    nav_df = cnyes_get_nav(cid)
+                with st.spinner("載入績效與配息資料..."):
+                    perf   = cnyes_get_perf(cid)
+                    # div_df 從 cache 取（搜尋時已抓過）
                     div_df = cnyes_get_div(cid)
 
-                latest_nav = row["淨值"] or 0
-                stats      = calc_fund_stats(nav_df)
-                div_stats  = calc_div_stats(div_df, latest_nav)
-                tags       = make_tags(stats, div_stats, div_df)
+                ds   = div_map.get(cid, calc_div_stats(div_df, nav_val))
+                tags = make_tags(perf, ds, div_df)
 
-                # Metrics
+                ann_yield = ds.get("ann_yield")
+                freq      = ds.get("freq", 0)
+                ann_std   = perf.get("ann_std")
+
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("💰 最新淨值", f"{latest_nav:.4f}")
-                ann_y = div_stats.get("ann_yield")
-                freq  = div_stats.get("freq", 0)
+                m1.metric("💰 最新淨值", f"{nav_val:.4f}", row.get("淨值日期",""))
                 m2.metric("✨ 預估年化配息率",
-                          f"{ann_y:.2f}%" if ann_y else "—",
-                          f"年配約 {freq} 次" if freq else "無配息")
-                std = stats.get("ann_std")
-                m3.metric("📉 年化波動率", f"{std:.2f}%" if std else "—")
+                          f"{ann_yield:.2f}%" if ann_yield else "無配息",
+                          {1:"年配",2:"半年配",4:"季配",12:"月配"}.get(freq,"") if freq else "")
+                m3.metric("📉 年化波動率", f"{ann_std:.2f}%" if ann_std else "—")
                 m4.metric("📌 特性標籤", tags)
 
-                # 報酬表
-                ret_data = {
-                    "期間": ["近3月","近6月","近1年","近3年"],
-                    "報酬率": [
-                        _fmt_pct_plain(stats.get("ret_3m")),
-                        _fmt_pct_plain(stats.get("ret_6m")),
-                        _fmt_pct_plain(stats.get("ret_1y")),
-                        _fmt_pct_plain(stats.get("ret_3y")),
-                    ]
-                }
-                # 如果 API 直接有值就優先用
+                # 報酬表（全部用 API 直接欄位，近3年用 perf 算）
                 it = items_map.get(cid, {})
-                if it.get("return3Month") is not None:
-                    ret_data["報酬率"][0] = _fmt_pct_plain(it["return3Month"])
-                if it.get("return6Month") is not None:
-                    ret_data["報酬率"][1] = _fmt_pct_plain(it["return6Month"])
-                if it.get("return1Year") is not None:
-                    ret_data["報酬率"][2] = _fmt_pct_plain(it["return1Year"])
-
-                st.dataframe(pd.DataFrame(ret_data), hide_index=True, use_container_width=False)
-
-                # 走勢圖
-                if not nav_df.empty:
-                    st.markdown("**淨值走勢（近3年）**")
-                    recent_nav = nav_df[nav_df["date"] >= pd.Timestamp.now() - pd.DateOffset(years=3)]
-                    st.line_chart(recent_nav.set_index("date")["nav"], height=200)
+                ret_rows = [
+                    {"期間":"近1月", "報酬率": _fmt_plain(it.get("return1Month"))},
+                    {"期間":"近3月", "報酬率": _fmt_plain(it.get("return3Month"))},
+                    {"期間":"近6月", "報酬率": _fmt_plain(it.get("return6Month"))},
+                    {"期間":"近1年", "報酬率": _fmt_plain(it.get("return1Year"))},
+                    {"期間":"近3年", "報酬率": _fmt_plain(perf.get("ret_3y"))},
+                ]
+                st.dataframe(pd.DataFrame(ret_rows), hide_index=True, use_container_width=False)
 
                 # 配息歷史
-                st.markdown("**配息歷程**")
+                st.markdown("**配息歷程（近3年）**")
                 if div_df.empty:
                     st.info("查無配息紀錄。")
                 else:
-                    div_display = div_df[["除息日","totalDistribution","nav","distributionYield"]].copy()
-                    div_display.columns = ["除息日","每單位配息","除息前淨值","單期配息率%"]
-                    div_display["除息日"] = div_display["除息日"].dt.strftime("%Y-%m-%d")
-                    div_display["單期配息率%"] = div_display["單期配息率%"].map("{:.2f}%".format)
-                    st.dataframe(div_display, hide_index=True, use_container_width=True)
+                    recent_div = div_df[
+                        div_df["除息日"] >= pd.Timestamp.now() - pd.DateOffset(years=3)
+                    ].copy()
+                    recent_div["除息日"]    = recent_div["除息日"].dt.strftime("%Y-%m-%d")
+                    recent_div["單期配息率"] = recent_div["distributionYield"].map("{:.2f}%".format)
+                    disp = recent_div[["除息日","totalDistribution","nav","單期配息率"]].copy()
+                    disp.columns = ["除息日","每單位配息","除息前淨值","單期配息率"]
+                    st.dataframe(disp, hide_index=True, use_container_width=True)
 
         st.divider()
 
-        # ── 購物車 ───────────────────────────────────────────────────────────
+        # ── 購物車 ────────────────────────────────────────────────────────────
         if not st.session_state.cnyes_cart.empty:
             st.markdown("### 🛒 鉅亨基金購物車")
-            st.dataframe(st.session_state.cnyes_cart, use_container_width=True,
-                         hide_index=True,
-                         column_config={"基金名稱": st.column_config.TextColumn("基金名稱", width="large")})
-
+            st.dataframe(
+                st.session_state.cnyes_cart,
+                use_container_width=True, hide_index=True,
+                column_config={"基金名稱": st.column_config.TextColumn("基金名稱", width="large")}
+            )
             dl1, dl2, dl3 = st.columns(3)
             with dl1:
                 st.download_button(
@@ -849,3 +802,332 @@ with tab2:
                 if st.button("🗑️ 清空購物車", use_container_width=True, key="cnyes_clear_cart"):
                     st.session_state.cnyes_cart = pd.DataFrame()
                     st.rerun()
+# -------------------------------------------------------------------------
+# Tab 2: 台灣可申購境外基金搜尋 (鉅亨網)
+# -------------------------------------------------------------------------
+import time as _time
+import numpy as _np
+
+CNYES_BASE     = "https://fund.api.cnyes.com"
+CNYES_SEARCH   = f"{CNYES_BASE}/fund/api/v2/search/fund"
+CNYES_PERF_URL = CNYES_BASE + "/fund/api/v1/funds/{cid}/history/performance"
+CNYES_DIV_URL  = CNYES_BASE + "/fund/api/v1/funds/{cid}/dividend"
+
+CNYES_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://fund.cnyes.com/",
+    "Origin": "https://fund.cnyes.com",
+    "X-Platform": "WEB",
+    "X-System-Kind": "FUND-DESKTOP",
+}
+CNYES_FIELDS = (
+    "categoryAbbr,change,changePercent,classCurrencyLocal,cnyesId,"
+    "displayNameLocal,forSale,investmentArea,nav,priceDate,"
+    "return1Month,return3Month,return6Month,return1Year,saleStatus"
+)
+CNYES_FUND_GROUP = {"全部":"","股票型":"G1","債券型":"G2","平衡型":"G3","保本型":"G4","貨幣型":"G5","其他":"G6"}
+CNYES_AREA = {
+    "全部":"","全球市場":"A3","美國":"A13","亞洲地區":"A1","台灣":"A6","中國/大中華":"A0",
+    "歐洲(含歐元區)":"A10","全球新興市場":"A4","日本":"A9","北美洲":"A5",
+    "拉丁美洲":"A7","新興歐洲":"A8","歐非中東":"A11",
+}
+CNYES_CURRENCY = {"全部":"","美元":"USD","台幣":"TWD","歐元":"EUR","日圓":"JPY","人民幣":"CNY","澳幣":"AUD","英鎊":"GBP"}
+CNYES_BRAND = {
+    "全部":"","安聯":"I26","宏利":"I27","富蘭克林":"I28","富達":"I29","富邦":"I30",
+    "摩根":"I37","施羅德":"I41","景順":"I45","聯博":"I66","貝萊德":"I73",
+    "高盛":"I79","野村":"I80","瀚亞":"I81","國泰":"I82",
+}
+
+# ── 工具 ──────────────────────────────────────────────────────────────────────
+def _ts(unix):
+    try: return datetime.datetime.utcfromtimestamp(int(unix)).strftime("%Y-%m-%d")
+    except: return "—"
+
+def _fp(v):
+    if v is None or (isinstance(v, float) and _np.isnan(v)): return "—"
+    return f"{v:+.2f}%"
+
+def _fp0(v):
+    if v is None or (isinstance(v, float) and _np.isnan(v)): return "—"
+    return f"{v:.2f}%"
+
+# ── API ───────────────────────────────────────────────────────────────────────
+def cnyes_search(page, fg, area, curr, brand, for_sale):
+    p = {"order":"priceDate","sort":"desc","page":page,"institutional":0,
+         "isShowTag":1,"fields":CNYES_FIELDS,"isVendor":0,"userFrom":"anue"}
+    if fg:       p["fundGroup"]                   = fg
+    if area:     p["investmentArea"]              = area
+    if curr:     p["classCurrency"]               = curr
+    if brand:    p["investmentProviderShortName"] = brand
+    if for_sale: p["forSale"]                     = 1
+    try:
+        r = requests.get(CNYES_SEARCH, params=p, headers=CNYES_HEADERS, timeout=12)
+        r.raise_for_status()
+        raw = r.json().get("items", {})
+        return {"items": raw.get("data",[]), "meta":{"last_page":raw.get("last_page",1),"total":raw.get("total",0)}}
+    except Exception as e:
+        st.error(f"鉅亨搜尋錯誤：{e}"); return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cnyes_get_perf(cid: str) -> dict:
+    """history/performance 週序列 → 波動率 + 近3年報酬"""
+    enc = cid.replace(",", "%2C")
+    start = int(_time.time()) - 3 * 366 * 24 * 3600
+    try:
+        r = requests.get(CNYES_PERF_URL.format(cid=enc),
+                         params={"by":"w","startAt":start}, headers=CNYES_HEADERS, timeout=12)
+        r.raise_for_status()
+        perf = r.json().get("items",{}).get("performance",[])
+        if len(perf) < 5: return {}
+        wr = [(1+perf[i]/100)/(1+perf[i-1]/100)-1 for i in range(1,len(perf))]
+        return {
+            "ann_std": float(_np.std(wr) * (52**0.5) * 100),
+            "ret_3y":  float(perf[-1]),
+            "n":       len(perf),
+        }
+    except: return {}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cnyes_get_div(cid: str) -> pd.DataFrame:
+    enc = cid.replace(",", "%2C")
+    try:
+        r = requests.get(CNYES_DIV_URL.format(cid=enc),
+                         params={"page":1}, headers=CNYES_HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("items",{}).get("data",[])
+        if not data: return pd.DataFrame()
+        df = pd.DataFrame(data)
+        df["除息日"] = pd.to_datetime(df["excludingDate"], unit="s")
+        return df.sort_values("除息日", ascending=False).reset_index(drop=True)
+    except: return pd.DataFrame()
+
+def _div_stats(div_df, nav):
+    if div_df.empty or not nav:
+        return {"ann_yield": None, "freq": 0}
+    rec = div_df[div_df["除息日"] >= pd.Timestamp.now() - pd.DateOffset(years=3)]
+    if rec.empty: return {"ann_yield": None, "freq": 0}
+    days = (rec["除息日"].max() - rec["除息日"].min()).days
+    freq = round(len(rec)/(days/365.25)) if days > 180 else len(rec)
+    freq = min(max(freq, 1), 12)
+    latest_div = float(rec.iloc[0]["totalDistribution"])
+    return {"ann_yield": (latest_div/nav)*freq*100, "freq": freq}
+
+def _make_tags(perf, div_stats, div_df):
+    tags = []
+    std = perf.get("ann_std")
+    if std is not None:
+        if std < 3:    tags.append("🧊超低波動")
+        elif std < 12: tags.append("🟢低波動")
+        elif std < 18: tags.append("🟡大盤波動")
+        else:          tags.append("🔴高波動")
+    else: tags.append("⚪波動未知")
+
+    r3y = perf.get("ret_3y")
+    if r3y is not None:
+        cagr = (1+r3y/100)**(1/3)-1
+        if cagr > 0.12:    tags.append("🚀高成長")
+        elif cagr >= 0.05: tags.append("📈大盤成長")
+        elif cagr > 0:     tags.append("🐢緩步成長")
+        else:              tags.append("📉衰退")
+    else: tags.append("⚪成長未知")
+
+    if not div_df.empty and len(div_df) >= 3:
+        ys = div_df["distributionYield"].values
+        my = ys.mean()
+        if my > 0:
+            cv = ys.std()/my
+            tr = pd.Series(ys).corr(pd.Series(range(len(ys))))
+            if cv < 0.15:                        tags.append("🛡️高穩定配息")
+            elif pd.notna(tr) and tr > 0.6:      tags.append("🔥配息增長中")
+            elif pd.notna(tr) and tr < -0.6:     tags.append("⚠️配息下降中")
+            else:                                tags.append("🔄配息波動大")
+        else: tags.append("⚪無配息")
+    elif div_df.empty: tags.append("⚪無配息")
+    else: tags.append("⚪配息次數偏少")
+    return " | ".join(tags)
+
+# ── session state ─────────────────────────────────────────────────────────────
+if "cnyes_cart" not in st.session_state:
+    st.session_state.cnyes_cart = pd.DataFrame()
+
+# ── Tab 2 UI ──────────────────────────────────────────────────────────────────
+with tab2:
+    st.subheader("🔍 台灣可申購境外基金搜尋 (鉅亨網)")
+
+    ck1,ck2,ck3,ck4,ck5 = st.columns([2,1.5,1.5,1.5,1.5])
+    with ck1: brand_lbl = st.selectbox("品牌", list(CNYES_BRAND.keys()), key="cnyes_brand")
+    with ck2: fg_lbl    = st.selectbox("基金類型", list(CNYES_FUND_GROUP.keys()), key="cnyes_fg")
+    with ck3: area_lbl  = st.selectbox("投資地區", list(CNYES_AREA.keys()), key="cnyes_area")
+    with ck4: curr_lbl  = st.selectbox("計價幣別", list(CNYES_CURRENCY.keys()), key="cnyes_curr")
+    with ck5:
+        st.write(""); st.write("")
+        for_sale = st.checkbox("僅可申購", value=True, key="cnyes_forsale")
+
+    btn_cnyes = st.button("🚀 搜尋", type="primary", key="btn_cnyes")
+    MAX_PAGES = 10
+
+    if btn_cnyes:
+        bv,fv,av,cv = CNYES_BRAND[brand_lbl],CNYES_FUND_GROUP[fg_lbl],CNYES_AREA[area_lbl],CNYES_CURRENCY[curr_lbl]
+        with st.spinner("連線鉅亨網中..."): data = cnyes_search(1,fv,av,cv,bv,for_sale)
+        if data:
+            meta,items,total,last_page = data["meta"],data["items"],data["meta"]["total"],data["meta"]["last_page"]
+            if last_page > 1:
+                bar = st.progress(1/min(last_page,MAX_PAGES), text="抓取更多結果...")
+                for pg in range(2,min(last_page,MAX_PAGES)+1):
+                    more = cnyes_search(pg,fv,av,cv,bv,for_sale)
+                    if more: items.extend(more["items"])
+                    bar.progress(pg/min(last_page,MAX_PAGES)); _time.sleep(0.12)
+                bar.empty()
+
+            # 批次抓配息（搜尋後立即計算，和 Tab 1 行為一致）
+            div_bar = st.progress(0, text="計算配息率...")
+            div_cache = {}
+            for i, it in enumerate(items):
+                cid = it.get("cnyesId","")
+                div_df = cnyes_get_div(cid)
+                nav    = it.get("nav") or 0
+                div_cache[cid] = _div_stats(div_df, nav)
+                div_bar.progress((i+1)/len(items))
+            div_bar.empty()
+
+            rows = []
+            for it in items:
+                cid = it.get("cnyesId","")
+                ds  = div_cache.get(cid, {})
+                ay  = ds.get("ann_yield")
+                fr  = ds.get("freq", 0)
+                freq_label = {1:"年配",2:"半年配",4:"季配",12:"月配"}.get(fr, f"{fr}次/年") if fr else ""
+                yield_str  = f"{ay:.2f}% ({freq_label})" if ay else "無配息"
+                rows.append({
+                    "加入購物車": False,
+                    "鉅亨ID":     cid,
+                    "基金名稱":   it.get("displayNameLocal",""),
+                    "計價幣別":   it.get("classCurrencyLocal",""),
+                    "投資地區":   it.get("investmentArea",""),
+                    "基金組別":   it.get("categoryAbbr",""),
+                    "淨值":       it.get("nav"),
+                    "今日漲跌%":  _fp(it.get("changePercent")),
+                    "近1月%":     _fp(it.get("return1Month")),
+                    "近3月%":     _fp(it.get("return3Month")),
+                    "近6月%":     _fp(it.get("return6Month")),
+                    "近1年%":     _fp(it.get("return1Year")),
+                    "年化配息率": yield_str,
+                    "淨值日期":   _ts(it.get("priceDate")),
+                    "可申購":     "✓" if it.get("forSale")==1 else "✗",
+                })
+            df_cnyes = pd.DataFrame(rows)
+            st.session_state["cnyes_results"]   = df_cnyes
+            st.session_state["cnyes_total"]     = total
+            st.session_state["cnyes_last_pg"]   = last_page
+            st.session_state["cnyes_items_map"] = {it["cnyesId"]: it for it in items}
+            st.session_state["cnyes_div_cache"] = div_cache
+        else:
+            st.warning("查無結果，請調整篩選條件。")
+            st.session_state.pop("cnyes_results", None)
+
+    # ── 顯示結果 ──────────────────────────────────────────────────────────────
+    if "cnyes_results" in st.session_state:
+        df_cnyes  = st.session_state["cnyes_results"]
+        total     = st.session_state.get("cnyes_total", len(df_cnyes))
+        last_page = st.session_state.get("cnyes_last_pg", 1)
+        cap = f"共找到 **{total:,}** 檔"
+        if last_page > MAX_PAGES: cap += f"，顯示前 **{len(df_cnyes)}** 筆"
+        st.success(cap)
+
+        st.markdown("### 📊 搜尋結果（可勾選加入購物車）")
+        edited_df = st.data_editor(
+            df_cnyes, use_container_width=True, hide_index=True,
+            column_config={
+                "加入購物車": st.column_config.CheckboxColumn("加入購物車", required=True),
+                "基金名稱":   st.column_config.TextColumn("基金名稱", width="large"),
+                "淨值":       st.column_config.NumberColumn("淨值", format="%.4f"),
+            }, height=420,
+        )
+
+        if st.button("🛒 將勾選項目加入購物車", key="cnyes_add_cart"):
+            sel = edited_df[edited_df["加入購物車"]].drop(columns=["加入購物車"])
+            if not sel.empty:
+                if st.session_state.cnyes_cart.empty: st.session_state.cnyes_cart = sel
+                else:
+                    st.session_state.cnyes_cart = pd.concat(
+                        [st.session_state.cnyes_cart, sel]
+                    ).drop_duplicates(subset=["鉅亨ID"], keep="last")
+                st.rerun()
+            else: st.warning("請先在表格勾選標的。")
+
+        st.divider()
+
+        # ── 個別詳細資訊 ──────────────────────────────────────────────────────
+        st.markdown("### 🔍 個別詳細資訊（點擊展開，自動計算波動率）")
+        items_map = st.session_state.get("cnyes_items_map", {})
+        div_cache = st.session_state.get("cnyes_div_cache", {})
+
+        for _, row in df_cnyes.iterrows():
+            cid  = row["鉅亨ID"]
+            name = row["基金名稱"]
+            nav_val = row["淨値"] if "淨値" in row else (row.get("淨值") or 0)
+            with st.expander(f"**{name}**　{row['計價幣別']}　{row['投資地區']}"):
+                with st.spinner("載入績效資料..."): perf = cnyes_get_perf(cid)
+                div_df = cnyes_get_div(cid)
+                ds     = div_cache.get(cid) or _div_stats(div_df, nav_val)
+                tags   = _make_tags(perf, ds, div_df)
+
+                ay, fr = ds.get("ann_yield"), ds.get("freq",0)
+                std    = perf.get("ann_std")
+                freq_txt = {1:"年配",2:"半年配",4:"季配",12:"月配"}.get(fr,f"{fr}次/年") if fr else ""
+
+                m1,m2,m3,m4 = st.columns(4)
+                m1.metric("💰 最新淨值", f"{nav_val:.4f}" if nav_val else "—")
+                m2.metric("✨ 預估年化配息率",
+                          f"{ay:.2f}%" if ay else "無配息",
+                          freq_txt)
+                m3.metric("📉 年化波動率", f"{std:.2f}%" if std else "—")
+                m4.metric("📌 特性標籤", tags)
+
+                # 報酬表 — 全用 API 直接欄位，近3年用 perf 計算
+                it = items_map.get(cid, {})
+                ret_rows = [
+                    {"期間":"近1月", "報酬率": _fp0(it.get("return1Month"))},
+                    {"期間":"近3月", "報酬率": _fp0(it.get("return3Month"))},
+                    {"期間":"近6月", "報酬率": _fp0(it.get("return6Month"))},
+                    {"期間":"近1年", "報酬率": _fp0(it.get("return1Year"))},
+                    {"期間":"近3年", "報酬率": _fp0(perf.get("ret_3y"))},
+                ]
+                st.dataframe(pd.DataFrame(ret_rows), hide_index=True, use_container_width=False)
+
+                # 配息歷程
+                st.markdown("**配息歷程（近3年）**")
+                if div_df.empty:
+                    st.info("查無配息紀錄。")
+                else:
+                    rec = div_df[div_df["除息日"] >= pd.Timestamp.now()-pd.DateOffset(years=3)].copy()
+                    rec["除息日"] = rec["除息日"].dt.strftime("%Y-%m-%d")
+                    rec["單期配息率"] = rec["distributionYield"].map("{:.2f}%".format)
+                    disp = rec[["除息日","totalDistribution","nav","單期配息率"]].copy()
+                    disp.columns = ["除息日","每單位配息","除息前淨值","單期配息率"]
+                    st.dataframe(disp, hide_index=True, use_container_width=True)
+
+        st.divider()
+
+        # ── 購物車 ────────────────────────────────────────────────────────────
+        if not st.session_state.cnyes_cart.empty:
+            st.markdown("### 🛒 鉅亨基金購物車")
+            st.dataframe(st.session_state.cnyes_cart, use_container_width=True, hide_index=True,
+                         column_config={"基金名稱": st.column_config.TextColumn("基金名稱", width="large")})
+            dl1,dl2,dl3 = st.columns(3)
+            with dl1:
+                st.download_button("📥 下載 CSV",
+                    data=st.session_state.cnyes_cart.to_csv(index=False,encoding="utf-8-sig").encode(),
+                    file_name=f"cnyes_cart_{datetime.date.today()}.csv", mime="text/csv", use_container_width=True)
+            with dl2:
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                    st.session_state.cnyes_cart.to_excel(w, index=False, sheet_name="鉅亨購物車")
+                st.download_button("📥 下載 Excel", data=buf.getvalue(),
+                    file_name=f"cnyes_cart_{datetime.date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+            with dl3:
+                if st.button("🗑️ 清空購物車", use_container_width=True, key="cnyes_clear_cart"):
+                    st.session_state.cnyes_cart = pd.DataFrame(); st.rerun()
