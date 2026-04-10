@@ -405,25 +405,21 @@ with tab1:
                             use_container_width=True, key=f"dl_{t}")
 
 # -------------------------------------------------------------------------
-# Tab 2: 台灣可申購境外基金搜尋 (鉅亨網 SSR)
+# Tab 2: 台灣可申購境外基金搜尋 (鉅亨網)
 # -------------------------------------------------------------------------
-import re as _re
-import json as _json
 import time as _time
 
-CNYES_SSR_URL = "https://fund.cnyes.com/search/"
-CNYES_HTML_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
-}
+CNYES_API_BASE = "https://fund.api.cnyes.com/fund/api/v2/search/fund"
 CNYES_API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://fund.cnyes.com/search/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": "https://fund.cnyes.com",
+    "Referer": "https://fund.cnyes.com/",
+    "x-platform": "WEB",
+    "x-system-kind": "FUND-DESKTOP",
 }
+CNYES_FIELDS = "categoryAbbr,change,changePercent,classCurrencyLocal,cnyesId,displayNameLocal,forSale,investmentArea,nav,priceDate,return1Month,saleStatus"
 
 CNYES_FUND_GROUP = {
     "全部": "", "股票型": "G1", "債券型": "G2", "平衡型": "G3",
@@ -439,36 +435,45 @@ CNYES_CURRENCY = {
     "全部": "", "美元": "USD", "台幣": "TWD", "歐元": "EUR",
     "日圓": "JPY", "人民幣": "CNY", "澳幣": "AUD", "英鎊": "GBP",
 }
+CNYES_BRAND = {
+    "全部": "", "安聯": "I26", "宏利": "I27", "富蘭克林": "I28",
+    "富達": "I29", "富邦": "I30", "摩根": "I37", "施羅德": "I41",
+    "景順": "I45", "聯博": "I66", "貝萊德": "I73", "高盛": "I79",
+    "野村": "I80", "瀚亞": "I81", "國泰": "I82",
+}
 
 
-def cnyes_page1(keyword, fund_group, area, currency, for_sale_only):
-    """第1頁：GET HTML → 解析 window.__data（不會被 404 擋）"""
-    params = {}
-    if keyword:       params["keyword"]        = keyword
-    if fund_group:    params["fundGroup"]      = fund_group
-    if area:          params["investmentArea"] = area
-    if currency:      params["classCurrency"]  = currency
-    if for_sale_only: params["forSale"]        = 1
-    r = requests.get(CNYES_SSR_URL, params=params,
-                     headers=CNYES_HTML_HEADERS, timeout=15)
-    r.raise_for_status()
-    match = _re.search(r'window\.__data\s*=\s*({.+?});\s*</script>',
-                       r.text, _re.DOTALL)
-    if not match:
+def cnyes_fetch(page: int, fund_group: str, area: str, currency: str,
+                brand: str, for_sale_only: bool) -> dict | None:
+    params = {
+        "order": "priceDate", "sort": "desc",
+        "page": page, "institutional": 0,
+        "isShowTag": 1, "fields": CNYES_FIELDS,
+        "isVendor": 0, "userFrom": "anue",
+    }
+    if fund_group:    params["fundGroup"]                    = fund_group
+    if area:          params["investmentArea"]               = area
+    if currency:      params["classCurrency"]                = currency
+    if brand:         params["investmentProviderShortName"]  = brand
+    if for_sale_only: params["forSale"]                      = 1
+    try:
+        r = requests.get(CNYES_API_BASE, params=params,
+                         headers=CNYES_API_HEADERS, timeout=12)
+        r.raise_for_status()
+        body = r.json()
+        raw  = body.get("items", {})
+        return {
+            "items": raw.get("data", []),
+            "meta": {
+                "current_page":  raw.get("current_page", page),
+                "last_page":     raw.get("last_page", 1),
+                "total":         raw.get("total", 0),
+                "next_page_url": raw.get("next_page_url"),
+            }
+        }
+    except Exception as e:
+        st.error(f"鉅亨 API 錯誤：{e}")
         return None
-    data = _json.loads(match.group(1))
-    fbq = data.get("fundByQuery", {})
-    if not fbq:
-        return None
-    return fbq[list(fbq.keys())[0]].get("data", {})
-
-
-def cnyes_next_page(next_page_url):
-    """第2頁起：用上一頁 meta.next_page_url 直接打 API"""
-    url = f"https://fund.cnyes.com{next_page_url}"
-    r = requests.get(url, headers=CNYES_API_HEADERS, timeout=12)
-    r.raise_for_status()
-    return r.json().get("data", {})
 
 
 def fmt_ret(v):
@@ -486,13 +491,11 @@ def ts_to_date(unix):
 
 with tab2:
     st.subheader("🔍 台灣可申購境外基金搜尋")
-    st.caption("資料來源：鉅亨網，涵蓋全部台灣核備可申購境外基金，無 5 筆限制。")
+    st.caption("資料來源：鉅亨網，涵蓋全部台灣核備可申購境外基金。")
 
-    # ── 篩選列 ──
-    ck1, ck2, ck3, ck4, ck5 = st.columns([3, 1.5, 1.5, 1.5, 1])
+    ck1, ck2, ck3, ck4, ck5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
     with ck1:
-        adv_kw = st.text_input("基金名稱關鍵字（中英文皆可）", "", key="cnyes_kw",
-                               placeholder="如：安聯、貝萊德、Income、Blackrock")
+        brand_lbl = st.selectbox("品牌", list(CNYES_BRAND.keys()), key="cnyes_brand")
     with ck2:
         fg_lbl = st.selectbox("基金類型", list(CNYES_FUND_GROUP.keys()), key="cnyes_fg")
     with ck3:
@@ -502,87 +505,76 @@ with tab2:
     with ck5:
         st.write("")
         st.write("")
-        for_sale = st.checkbox("僅顯示可申購", value=True, key="cnyes_forsale")
+        for_sale = st.checkbox("僅可申購", value=True, key="cnyes_forsale")
 
-    cb1, cb2 = st.columns([1, 5])
-    with cb1:
-        btn_cnyes = st.button("🚀 搜尋", type="primary", use_container_width=True, key="btn_cnyes")
+    st.caption("💡 目前支援以品牌篩選，關鍵字搜尋功能開發中。")
 
-    # ── 執行搜尋 ──
+    btn_cnyes = st.button("🚀 搜尋", type="primary", key="btn_cnyes")
+
     MAX_PAGES = 10
-    if btn_cnyes:
-        with st.spinner("連線鉅亨網搜尋中..."):
-            try:
-                data = cnyes_page1(
-                    keyword=adv_kw.strip(),
-                    fund_group=CNYES_FUND_GROUP[fg_lbl],
-                    area=CNYES_AREA[area_lbl],
-                    currency=CNYES_CURRENCY[curr_lbl],
-                    for_sale_only=for_sale,
-                )
-            except Exception as e:
-                st.error(f"鉅亨網連線失敗：{e}")
-                data = None
-        if data:
-            meta      = data.get("meta", {})
-            items     = data.get("items", [])
-            total     = meta.get("total", len(items))
-            last_page = meta.get("last_page", 1)
-            next_url  = meta.get("next_page_url")
 
-            # 第2頁起用 next_page_url 直接打 API
+    if btn_cnyes:
+        brand_val = CNYES_BRAND[brand_lbl]
+        fg_val    = CNYES_FUND_GROUP[fg_lbl]
+        area_val  = CNYES_AREA[area_lbl]
+        curr_val  = CNYES_CURRENCY[curr_lbl]
+
+        with st.spinner("連線鉅亨網中..."):
+            data = cnyes_fetch(1, fg_val, area_val, curr_val, brand_val, for_sale)
+
+        if data:
+            meta      = data["meta"]
+            items     = data["items"]
+            total     = meta["total"]
+            last_page = meta["last_page"]
+            next_url  = meta["next_page_url"]
+
             if last_page > 1 and next_url:
                 bar = st.progress(1 / min(last_page, MAX_PAGES), text="抓取更多結果...")
                 for pg in range(2, min(last_page, MAX_PAGES) + 1):
-                    try:
-                        more = cnyes_next_page(next_url)
-                        items.extend(more.get("items", []))
-                        next_url = more.get("meta", {}).get("next_page_url")
-                    except Exception:
-                        break
+                    more = cnyes_fetch(pg, fg_val, area_val, curr_val, brand_val, for_sale)
+                    if more:
+                        items.extend(more["items"])
+                        next_url = more["meta"].get("next_page_url")
                     bar.progress(pg / min(last_page, MAX_PAGES))
-                    _time.sleep(0.15)
+                    _time.sleep(0.12)
                     if not next_url:
                         break
                 bar.empty()
 
-            if items:
-                rows = []
-                for it in items:
-                    rows.append({
-                        "鉅亨ID":       it.get("cnyesId", ""),
-                        "基金名稱":      it.get("displayNameLocal", ""),
-                        "計價幣別":      it.get("classCurrencyLocal", ""),
-                        "投資地區":      it.get("investmentArea", ""),
-                        "基金組別":      it.get("categoryAbbr", ""),
-                        "淨值":          it.get("nav"),
-                        "今日漲跌%":     fmt_ret(it.get("changePercent")),
-                        "近1月報酬%":    fmt_ret(it.get("return1Month")),
-                        "近3月報酬%":    fmt_ret(it.get("return3Month")),
-                        "近6月報酬%":    fmt_ret(it.get("return6Month")),
-                        "近1年報酬%":    fmt_ret(it.get("return1Year")),
-                        "淨值日期":      ts_to_date(it.get("priceDate")),
-                        "可申購":        "✓" if it.get("forSale") == 1 else "✗",
-                    })
-                df_cnyes = pd.DataFrame(rows)
-                st.session_state["cnyes_results"] = df_cnyes
-                st.session_state["cnyes_total"] = total
-                st.session_state["cnyes_last_page"] = last_page
-            else:
-                st.warning("查無結果，請調整篩選條件。")
-                st.session_state.pop("cnyes_results", None)
+            rows = []
+            for it in items:
+                rows.append({
+                    "鉅亨ID":    it.get("cnyesId", ""),
+                    "基金名稱":   it.get("displayNameLocal", ""),
+                    "計價幣別":   it.get("classCurrencyLocal", ""),
+                    "投資地區":   it.get("investmentArea", ""),
+                    "基金組別":   it.get("categoryAbbr", ""),
+                    "淨值":       it.get("nav"),
+                    "今日漲跌%":  fmt_ret(it.get("changePercent")),
+                    "近1月報酬%": fmt_ret(it.get("return1Month")),
+                    "淨值日期":   ts_to_date(it.get("priceDate")),
+                    "可申購":     "✓" if it.get("forSale") == 1 else "✗",
+                })
 
-    # ── 顯示結果（與搜尋按鈕解耦，rerun 不消失）──
+            df_cnyes = pd.DataFrame(rows)
+            st.session_state["cnyes_results"]   = df_cnyes
+            st.session_state["cnyes_total"]     = total
+            st.session_state["cnyes_last_page"] = last_page
+        else:
+            st.warning("查無結果，請調整篩選條件。")
+            st.session_state.pop("cnyes_results", None)
+
     if "cnyes_results" in st.session_state:
-        df_cnyes   = st.session_state["cnyes_results"]
-        total      = st.session_state.get("cnyes_total", len(df_cnyes))
-        last_page  = st.session_state.get("cnyes_last_page", 1)
+        df_cnyes  = st.session_state["cnyes_results"]
+        total     = st.session_state.get("cnyes_total", len(df_cnyes))
+        last_page = st.session_state.get("cnyes_last_page", 1)
 
         showing = len(df_cnyes)
-        if last_page > 10:
-            st.success(f"共找到 **{total:,}** 檔，顯示前 **{showing}** 筆（最多抓 200 筆）")
+        if last_page > MAX_PAGES:
+            st.success(f"共 **{total:,}** 檔，顯示前 **{showing}** 筆")
         else:
-            st.success(f"共找到 **{total:,}** 檔，全部顯示")
+            st.success(f"共找到 **{total:,}** 檔")
 
         st.dataframe(
             df_cnyes,
@@ -592,20 +584,14 @@ with tab2:
                 "基金名稱": st.column_config.TextColumn("基金名稱", width="large"),
                 "淨值": st.column_config.NumberColumn("淨值", format="%.4f"),
             },
-            height=500,
-        )
-
-        st.info(
-            "💡 **操作提示**：找到目標後，可至 **鉅亨網** 查詢完整資訊；"
-            "或將基金代碼貼回第一頁 **【🌐 ETF 與海外基金】** 查詢 Yahoo 走勢圖（部分境外基金在 Yahoo 有對應 ticker）。"
+            height=520,
         )
 
         dl1, dl2 = st.columns(2)
         with dl1:
-            csv_bytes = df_cnyes.to_csv(index=False, encoding="utf-8-sig").encode()
             st.download_button(
                 "📥 下載 CSV",
-                data=csv_bytes,
+                data=df_cnyes.to_csv(index=False, encoding="utf-8-sig").encode(),
                 file_name=f"cnyes_fund_{datetime.date.today()}.csv",
                 mime="text/csv",
                 use_container_width=True,
